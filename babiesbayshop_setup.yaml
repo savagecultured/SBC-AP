@@ -38,6 +38,7 @@
     backup_retention_days: 7
 
   roles: []
+  # TODO: Refactor playbook into modular Ansible roles for maintainability.
 
   tasks:
     - name: Update package cache
@@ -624,6 +625,20 @@
           logpath = %(sshd_log)s
           maxretry = 3
           bantime = 24h
+
+          [nginx-http-auth]
+          enabled = true
+          port    = http,https
+          filter  = nginx-http-auth
+          logpath = /var/log/nginx/error.log
+          maxretry = 3
+
+          [php-fpm]
+          enabled = true
+          port    = http,https
+          filter  = php-fpm
+          logpath = /var/log/php8.1-fpm.log
+          maxretry = 3
         owner: root
         group: root
         mode: '0644'
@@ -639,7 +654,7 @@
       copy:
         dest: /usr/local/bin/check_system.sh
         content: |
-          #!/bin/bash
+         #!/bin/bash
           echo "=== BabiesBayShop System Status ==="
           echo "Date: $(date)"
           echo
@@ -654,6 +669,12 @@
           echo
           echo "Disk Usage:"
           df -h / /var/www/html
+          echo
+          echo "SSL Certificate Check:"
+          openssl x509 -in {{ ssl_cert_path }} -noout -dates || echo "SSL check failed"
+          echo
+          echo "MariaDB Connectivity:"
+          mysqladmin -u root -p'{{ wp_db_root_password }}' ping || echo "MariaDB check failed"
         owner: root
         group: root
         mode: '0755'
