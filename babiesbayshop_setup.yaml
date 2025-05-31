@@ -21,10 +21,10 @@
     captive_portal_https_port: 443
 
     # === WordPress/MariaDB (using default locations) ===
-    wp_db_root_password: ReplaceWithStrongRootPass
+    wp_db_root_password: wpr63GK94t<
     wp_db_name: wordpress
-    wp_db_user: wpuser
-    wp_db_password: ReplaceWithStrongWPUserPass
+    wp_db_user: savage
+    wp_db_password: wps63GK94e<
     wp_site_domain: babiesbayshop.local
     wp_install_dir: /var/www/html
 
