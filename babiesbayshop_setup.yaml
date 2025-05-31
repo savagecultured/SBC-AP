@@ -1,0 +1,691 @@
+---
+- name: Deploy "BabiesBayShop" Orange Pi AP + WordPress + Captive Portal
+  hosts: babiesbayshop
+  become: yes
+  vars:
+    # === Network & Wireless ===
+    wifi_interface: wlx00c0ca98ccaa
+    wifi_ssid: BabiesBayShop
+    wifi_channel: 6
+    wifi_hw_mode: g
+    wifi_country_code: ZW
+
+    # IP plan
+    ap_ip: 10.10.10.1
+    ap_netmask: 255.255.255.0
+    dhcp_range_start: 10.10.10.100
+    dhcp_range_end: 10.10.10.200
+    dhcp_lease_time: 12h
+    dhcp_dns: "{{ ap_ip }}"
+    captive_portal_http_port: 80
+    captive_portal_https_port: 443
+
+    # === WordPress/MariaDB (using default locations) ===
+    wp_db_root_password: ReplaceWithStrongRootPass
+    wp_db_name: wordpress
+    wp_db_user: wpuser
+    wp_db_password: ReplaceWithStrongWPUserPass
+    wp_site_domain: babiesbayshop.local
+    wp_install_dir: /var/www/html
+
+    # === SSL/Certificates ===
+    ssl_cert_path: /etc/ssl/certs/{{ wp_site_domain }}.crt
+    ssl_key_path: /etc/ssl/private/{{ wp_site_domain }}.key
+
+    # === Backup ===
+    backup_script_path: /usr/local/bin/backup_wp.sh
+    backup_dest: /var/backups/wordpress
+    backup_retention_days: 7
+
+  roles: []
+
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required APT packages
+      apt:
+        name:
+          - nginx
+          - php8.1-fpm
+          - php8.1-mysql
+          - php8.1-curl
+          - php8.1-gd
+          - php8.1-xml
+          - php8.1-mbstring
+          - php8.1-zip
+          - mariadb-server
+          - hostapd
+          - dnsmasq
+          - nftables
+          - openssl
+          - fail2ban
+          - logrotate
+          - rsync
+          - curl
+          - wget
+        state: present
+
+    - name: Disable systemd-resolved to avoid DNS conflicts
+      service:
+        name: systemd-resolved
+        state: stopped
+        enabled: no
+
+    - name: Create static resolv.conf
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 8.8.8.8
+          nameserver 1.1.1.1
+        owner: root
+        group: root
+        mode: '0644'
+
+    # === MariaDB Setup ===
+    - name: Start and enable MariaDB
+      service:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Set MariaDB root password
+      mysql_user:
+        name: root
+        password: "{{ wp_db_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        state: present
+
+    - name: Remove anonymous MySQL users
+      mysql_user:
+        name: ""
+        host_all: yes
+        state: absent
+        login_user: root
+        login_password: "{{ wp_db_root_password }}"
+
+    - name: Remove MySQL test database
+      mysql_db:
+        name: test
+        state: absent
+        login_user: root
+        login_password: "{{ wp_db_root_password }}"
+
+    - name: Create WordPress database
+      mysql_db:
+        name: "{{ wp_db_name }}"
+        state: present
+        login_user: root
+        login_password: "{{ wp_db_root_password }}"
+
+    - name: Create WordPress DB user
+      mysql_user:
+        name: "{{ wp_db_user }}"
+        password: "{{ wp_db_password }}"
+        priv: "{{ wp_db_name }}.*:ALL"
+        host: localhost
+        state: present
+        login_user: root
+        login_password: "{{ wp_db_root_password }}"
+
+    # === WordPress Setup ===
+    - name: Ensure web directory exists
+      file:
+        path: "{{ wp_install_dir }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Download latest WordPress
+      get_url:
+        url: https://wordpress.org/latest.tar.gz
+        dest: /tmp/wordpress.tar.gz
+        mode: '0644'
+
+    - name: Extract WordPress
+      unarchive:
+        src: /tmp/wordpress.tar.gz
+        dest: /tmp
+        remote_src: yes
+
+    - name: Copy WordPress files to web root
+      shell: |
+        cp -r /tmp/wordpress/* {{ wp_install_dir }}/
+        chown -R www-data:www-data {{ wp_install_dir }}
+      args:
+        creates: "{{ wp_install_dir }}/wp-config-sample.php"
+
+    - name: Generate WordPress salt keys
+      uri:
+        url: https://api.wordpress.org/secret-key/1.1/salt/
+        return_content: yes
+      register: wp_salt_keys
+
+    - name: Create wp-config.php
+      template:
+        dest: "{{ wp_install_dir }}/wp-config.php"
+        content: |
+          <?php
+          define('DB_NAME', '{{ wp_db_name }}');
+          define('DB_USER', '{{ wp_db_user }}');
+          define('DB_PASSWORD', '{{ wp_db_password }}');
+          define('DB_HOST', 'localhost');
+          define('DB_CHARSET', 'utf8mb4');
+          define('DB_COLLATE', '');
+          
+          {{ wp_salt_keys.content }}
+          
+          $table_prefix = 'wp_';
+          define('WP_DEBUG', false);
+          define('FORCE_SSL_ADMIN', true);
+          
+          if ( !defined('ABSPATH') ) {
+            define('ABSPATH', dirname(__FILE__) . '/');
+          }
+          require_once ABSPATH . 'wp-settings.php';
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Set proper WordPress permissions
+      file:
+        path: "{{ wp_install_dir }}"
+        owner: www-data
+        group: www-data
+        recurse: yes
+        mode: u=rwX,g=rX,o=rX
+
+    - name: Set writable permissions for wp-content
+      file:
+        path: "{{ wp_install_dir }}/wp-content"
+        mode: '0755'
+        recurse: yes
+
+    # === PHP Configuration ===
+    - name: Configure PHP-FPM for better performance
+      ini_file:
+        path: /etc/php/8.1/fpm/pool.d/www.conf
+        section: www
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        backup: yes
+      loop:
+        - { option: 'pm', value: 'dynamic' }
+        - { option: 'pm.max_children', value: '10' }
+        - { option: 'pm.start_servers', value: '4' }
+        - { option: 'pm.min_spare_servers', value: '2' }
+        - { option: 'pm.max_spare_servers', value: '6' }
+        - { option: 'pm.max_requests', value: '500' }
+
+    - name: Configure PHP settings
+      ini_file:
+        path: /etc/php/8.1/fpm/php.ini
+        section: PHP
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+      loop:
+        - { option: 'upload_max_filesize', value: '32M' }
+        - { option: 'post_max_size', value: '32M' }
+        - { option: 'max_execution_time', value: '300' }
+        - { option: 'memory_limit', value: '256M' }
+
+    - name: Restart PHP-FPM
+      service:
+        name: php8.1-fpm
+        state: restarted
+        enabled: yes
+
+    # === SSL Certificate Generation ===
+    - name: Generate self-signed SSL certificate
+      shell: |
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout {{ ssl_key_path }} \
+        -out {{ ssl_cert_path }} \
+        -subj "/C=ZW/ST=Province/L=City/O=BabiesBayShop/CN={{ wp_site_domain }}"
+      args:
+        creates: "{{ ssl_cert_path }}"
+
+    - name: Set SSL certificate permissions
+      file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - "{{ ssl_cert_path }}"
+        - "{{ ssl_key_path }}"
+
+    # === Nginx Configuration ===
+    - name: Create captive portal detection page
+      copy:
+        dest: "{{ wp_install_dir }}/generate_204"
+        content: ""
+        owner: www-data
+        group: www-data
+        mode: '0644'
+
+    - name: Create Nginx configuration
+      copy:
+        dest: /etc/nginx/sites-available/babiesbayshop.conf
+        content: |
+          # Captive portal detection responses
+          server {
+              listen 80;
+              server_name _;
+              
+              # Android captive portal detection
+              location = /generate_204 {
+                  return 204;
+              }
+              
+              # iOS/macOS captive portal detection
+              location = /hotspot-detect.html {
+                  return 200 "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+                  add_header Content-Type text/html;
+              }
+              
+              # Windows captive portal detection
+              location = /ncsi.txt {
+                  return 200 "Microsoft NCSI";
+                  add_header Content-Type text/plain;
+              }
+              
+              # Default redirect to portal
+              location / {
+                  return 302 https://{{ wp_site_domain }}$request_uri;
+              }
+          }
+
+          # Main WordPress site with captive portal
+          server {
+              listen 443 ssl http2;
+              server_name {{ wp_site_domain }} {{ ap_ip }} _;
+              
+              ssl_certificate {{ ssl_cert_path }};
+              ssl_certificate_key {{ ssl_key_path }};
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
+              ssl_prefer_server_ciphers off;
+
+              root {{ wp_install_dir }};
+              index index.php index.html index.htm;
+
+              client_max_body_size 32M;
+
+              # WordPress pretty permalinks
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              # PHP processing
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+                  fastcgi_param HTTPS on;
+              }
+
+              # Security headers
+              add_header X-Frame-Options "SAMEORIGIN" always;
+              add_header X-Content-Type-Options "nosniff" always;
+              add_header X-XSS-Protection "1; mode=block" always;
+              add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+              # Deny access to sensitive files
+              location ~ /\.ht {
+                  deny all;
+              }
+              
+              location ~ /wp-config\.php {
+                  deny all;
+              }
+
+              # Cache static files
+              location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+                  expires 1y;
+                  add_header Cache-Control "public, immutable";
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/babiesbayshop.conf
+        dest: /etc/nginx/sites-enabled/babiesbayshop.conf
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test and reload Nginx
+      shell: nginx -t && systemctl reload nginx
+
+    # === Wireless Access Point Setup ===
+    - name: Configure hostapd
+      copy:
+        dest: /etc/hostapd/hostapd.conf
+        content: |
+          interface={{ wifi_interface }}
+          driver=nl80211
+          ssid={{ wifi_ssid }}
+          hw_mode={{ wifi_hw_mode }}
+          channel={{ wifi_channel }}
+          wmm_enabled=0
+          macaddr_acl=0
+          auth_algs=1
+          ignore_broadcast_ssid=0
+          wpa=0
+          country_code={{ wifi_country_code }}
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Configure hostapd daemon
+      lineinfile:
+        path: /etc/default/hostapd
+        regexp: '^#?DAEMON_CONF='
+        line: 'DAEMON_CONF="/etc/hostapd/hostapd.conf"'
+        state: present
+
+    # === DNS and DHCP with dnsmasq ===
+    - name: Configure dnsmasq
+      copy:
+        dest: /etc/dnsmasq.conf
+        content: |
+          # Basic configuration
+          interface={{ wifi_interface }}
+          bind-interfaces
+          
+          # DHCP configuration
+          dhcp-range={{ dhcp_range_start }},{{ dhcp_range_end }},{{ ap_netmask }},{{ dhcp_lease_time }}
+          dhcp-option=option:router,{{ ap_ip }}
+          dhcp-option=option:dns-server,{{ ap_ip }}
+          dhcp-authoritative
+          
+          # DNS configuration
+          no-resolv
+          server=8.8.8.8
+          server=1.1.1.1
+          
+          # Captive portal - redirect all DNS queries to our IP
+          address=/#/{{ ap_ip }}
+          
+          # Log queries for debugging
+          log-queries
+          log-dhcp
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start dnsmasq
+      service:
+        name: dnsmasq
+        enabled: yes
+        state: restarted
+
+    # === Network Interface Configuration ===
+    - name: Configure wireless interface
+      copy:
+        dest: /etc/systemd/network/10-{{ wifi_interface }}.network
+        content: |
+          [Match]
+          Name={{ wifi_interface }}
+
+          [Network]
+          Address={{ ap_ip }}/24
+          IPMasquerade=yes
+          IPForward=yes
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable systemd-networkd
+      service:
+        name: systemd-networkd
+        enabled: yes
+        state: started
+
+    # === nftables Firewall Configuration ===
+    - name: Configure nftables rules
+      copy:
+        dest: /etc/nftables.conf
+        content: |
+          #!/usr/sbin/nft -f
+
+          flush ruleset
+
+          table inet filter {
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  
+                  # Allow loopback
+                  iif lo accept
+                  
+                  # Allow established/related connections
+                  ct state established,related accept
+                  
+                  # Allow SSH from ethernet (admin access)
+                  iifname eth0 tcp dport ssh accept
+                  
+                  # Allow HTTP/HTTPS for captive portal
+                  iifname {{ wifi_interface }} tcp dport { http, https } accept
+                  iifname eth0 tcp dport { http, https } accept
+                  
+                  # Allow DNS and DHCP on wireless interface
+                  iifname {{ wifi_interface }} udp dport { bootps, domain } accept
+                  iifname {{ wifi_interface }} tcp dport domain accept
+                  
+                  # Allow ping
+                  icmp type echo-request accept
+                  
+                  # Log dropped packets
+                  log prefix "INPUT DROP: " drop
+              }
+
+              chain forward {
+                  type filter hook forward priority 0; policy drop;
+                  
+                  # Allow established/related connections
+                  ct state established,related accept
+                  
+                  # Allow traffic from wireless to internet (if needed)
+                  iifname {{ wifi_interface }} oifname eth0 accept
+                  
+                  # Log dropped packets
+                  log prefix "FORWARD DROP: " drop
+              }
+
+              chain output {
+                  type filter hook output priority 0; policy accept;
+              }
+          }
+
+          table ip nat {
+              chain prerouting {
+                  type nat hook prerouting priority -100; policy accept;
+                  
+                  # Redirect HTTP to our server
+                  iifname {{ wifi_interface }} tcp dport http redirect to :{{ captive_portal_http_port }}
+                  
+                  # Redirect HTTPS to our server  
+                  iifname {{ wifi_interface }} tcp dport https redirect to :{{ captive_portal_https_port }}
+              }
+
+              chain postrouting {
+                  type nat hook postrouting priority 100; policy accept;
+                  
+                  # Masquerade for internet access (if needed)
+                  oifname eth0 masquerade
+              }
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start nftables
+      service:
+        name: nftables
+        enabled: yes
+        state: restarted
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: yes
+
+    - name: Enable hostapd
+      service:
+        name: hostapd
+        enabled: yes
+        state: restarted
+
+    # === Backup Configuration ===
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dest }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Deploy WordPress backup script
+      copy:
+        dest: "{{ backup_script_path }}"
+        content: |
+          #!/usr/bin/env bash
+          set -e
+          
+          TIMESTAMP=$(date +'%Y%m%d-%H%M%S')
+          BACKUP_DIR="{{ backup_dest }}/$TIMESTAMP"
+          
+          echo "Starting backup at $(date)"
+          
+          mkdir -p "$BACKUP_DIR"
+          
+          # Database backup
+          mysqldump -u root -p'{{ wp_db_root_password }}' {{ wp_db_name }} > "$BACKUP_DIR/{{ wp_db_name }}.sql"
+          
+          # Files backup
+          tar czf "$BACKUP_DIR/wp-files.tar.gz" -C "{{ wp_install_dir }}" .
+          
+          # Cleanup old backups
+          find "{{ backup_dest }}" -maxdepth 1 -type d -name "20*" -mtime +{{ backup_retention_days }} -exec rm -rf {} \;
+          
+          echo "Backup completed at $(date)"
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Create backup log rotation
+      copy:
+        dest: /etc/logrotate.d/wordpress-backup
+        content: |
+          /var/log/backup_wp.log {
+              daily
+              rotate 7
+              compress
+              missingok
+              notifempty
+              create 0640 root adm
+          }
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Schedule daily backup
+      cron:
+        name: "Daily WordPress Backup"
+        user: root
+        minute: "0"
+        hour: "2"
+        job: "{{ backup_script_path }} >> /var/log/backup_wp.log 2>&1"
+
+    # === Security Configuration ===
+    - name: Configure fail2ban for SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port = ssh
+          logpath = %(sshd_log)s
+          maxretry = 3
+          bantime = 24h
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Start and enable fail2ban
+      service:
+        name: fail2ban
+        enabled: yes
+        state: restarted
+
+    # === Final System Configuration ===
+    - name: Create system status check script
+      copy:
+        dest: /usr/local/bin/check_system.sh
+        content: |
+          #!/bin/bash
+          echo "=== BabiesBayShop System Status ==="
+          echo "Date: $(date)"
+          echo
+          echo "Network Interface Status:"
+          ip addr show {{ wifi_interface }} | grep -E "(inet|state)"
+          echo
+          echo "Services Status:"
+          systemctl is-active hostapd dnsmasq nginx php8.1-fpm mariadb nftables
+          echo
+          echo "Connected Clients:"
+          awk '/{{ wifi_interface }}/ {print $2, $3, $4}' /var/lib/dhcp/dhcpd.leases 2>/dev/null || echo "No DHCP leases found"
+          echo
+          echo "Disk Usage:"
+          df -h / /var/www/html
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Final system cleanup
+      shell: |
+        rm -f /tmp/wordpress.tar.gz
+        rm -rf /tmp/wordpress
+        apt autoremove -y
+        apt autoclean
+
+    - name: Display setup completion message
+      debug:
+        msg: |
+          =====================================
+          BabiesBayShop Setup Complete!
+          =====================================
+          
+          Access Points:
+          - WiFi SSID: {{ wifi_ssid }} (Open)
+          - Portal IP: {{ ap_ip }}
+          - Domain: {{ wp_site_domain }}
+          
+          Admin Access:
+          - SSH: Connect via ethernet interface
+          - WordPress: https://{{ ap_ip }}/wp-admin/
+          - System Status: /usr/local/bin/check_system.sh
+          
+          Important Notes:
+          - Change default database passwords
+          - Configure WordPress admin account
+          - Review nftables rules for internet access
+          - Monitor logs in /var/log/
+          
+          =====================================
